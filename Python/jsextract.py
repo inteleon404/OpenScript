@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 import argparse
 import concurrent.futures
@@ -8,465 +7,478 @@ import os
 import re
 import sys
 import threading
-from urllib.parse import urljoin, urlparse, urlunparse
+import urllib.parse
+import urllib3
+from typing import List, Set, Tuple
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util import Retry
-import urllib3
-from bs4 import BeautifulSoup
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S"
+logging.basicConfig(format="[%(levelname)s] %(message)s", level=logging.INFO)
+logger = logging.getLogger("jsextract")
+
+# Endpoints inside JS source: absolute (scheme://), protocol-relative (//)
+# and relative (/path/...) URLs.
+ENDPOINT_REGEX = re.compile(
+    r'(?:"|\')('
+    r'(?:[a-zA-Z]{1,10}://|//)'
+    r'[^"\s\'`]{2,}'
+    r'|'
+    r'/(?:[a-zA-Z0-9_.\-]+/)*[a-zA-Z0-9_.\-]+\.[a-zA-Z0-9]{2,4}(?:\?[^"\s\'`]*)?'
+    r'|'
+    r'/(?:[a-zA-Z0-9_.\-]+/)+[a-zA-Z0-9_.\-]*(?:\?[^"\s\'`]*)?'
+    r'|'
+    r'/api/v[0-9]+/[a-zA-Z0-9_.\-/]+(?:\?[^"\s\'`]*)?'
+    r')(?:"|\')',
+    re.IGNORECASE
 )
-logger = logging.getLogger("ReconUtility")
 
-JS_PATTERNS = [
-    re.compile(r"""(?P<quote>["'`])(?P<url>(?:https?://|//)[^"'#\s]+)(?P=quote)""", re.VERBOSE),
-    re.compile(r"""(?P<quote>["'`])(?P<url>(?:/|\./|\.\./)[^"'#\s<>]+)(?P=quote)""", re.VERBOSE),
-    re.compile(r"""(?P<quote>["'`])(?P<url>[a-zA-Z0-9_\-/]+/[a-zA-Z0-9_\-/]+\.(?:php|asp|aspx|jsp|json|action|html|txt|xml|js)(?:\?[^"'#\s]*)?)(?P=quote)""", re.VERBOSE),
-    re.compile(r"""(?P<quote>["'`])(?P<url>[a-zA-Z0-9_\-]+\.(?:php|asp|aspx|jsp|json|action|html|txt|xml|js)(?:\?[^"'#\s]*)?)(?P=quote)""", re.VERBOSE)
-]
+# JavaScript resources ONLY: .js, .mjs, .cjs (with optional query string).
+JS_FILE_REGEX = re.compile(
+    r'(?:src|href)=["\']([^"\']+\.(?:js|mjs|cjs)(?:\?[^"\']*)?)["\']'
+    r'|(?:"|\')([^"\']+\.(?:js|mjs|cjs)(?:\?[^"\']*)?)(?:"|\')',
+    re.IGNORECASE
+)
 
-STATIC_ASSETS_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".ico", ".webp",
-    ".css", ".woff", ".woff2", ".ttf", ".eot", ".otf",
-    ".mp4", ".avi", ".mov", ".wmv", ".flv", ".mp3", ".wav",
-    ".zip", ".tar", ".gz", ".rar", ".7z", ".pdf", ".doc", ".docx"
+# Non-JavaScript extensions are never treated as resources.
+JS_EXTENSIONS = (".js", ".mjs", ".cjs")
+
+STATIC_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp",
+    ".css", ".woff", ".woff2", ".ttf", ".eot", ".otf", ".mp4", ".mp3",
+    ".pdf", ".zip", ".gz", ".tar", ".7z", ".exe",
+    ".html", ".htm", ".php", ".asp", ".aspx", ".jsp", ".xml", ".json"
 }
 
-UNSUPPORTED_SCHEMES = {
-    "javascript", "data", "mailto", "tel", "blob", "ftp", "file", "ws", "wss"
-}
-
-MAX_RESPONSE_SIZE = 10 * 1024 * 1024  # 10 MB
-
-thread_local = threading.local()
-
-
-def create_session(cookie: str | None, headers: dict | None, insecure: bool) -> requests.Session:
-    session = requests.Session()
-    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retries)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-
-    default_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5"
-    }
-    if cookie:
-        default_headers["Cookie"] = cookie
-    if headers:
-        default_headers.update(headers)
-    session.headers.update(default_headers)
-    if insecure:
-        session.verify = False
-    return session
-
-
-def get_session(cookie: str | None, headers: dict | None, insecure: bool) -> requests.Session:
-    if not hasattr(thread_local, "session"):
-        thread_local.session = create_session(cookie, headers, insecure)
-    return thread_local.session
+MAX_RESPONSE_SIZE = 10 * 1024 * 1024
+MAX_REDIRECTS = 5
 
 
 class ScopeManager:
-    def __init__(self, scopes: list[str], initial_urls: list[str]):
-        self.scopes = set()
-        for s in scopes:
-            clean = s.strip().lower().lstrip("*.")
-            if clean:
-                self.scopes.add(clean)
-        
-        if not self.scopes:
-            for u in initial_urls:
-                try:
-                    parsed = urlparse(u)
-                    if parsed.hostname:
-                        self.scopes.add(parsed.hostname.lower())
-                except Exception:
-                    pass
+    """Strict hostname-boundary scope: root domain (+ subdomains by default)."""
+
+    def __init__(self, target_url: str, include_subs: bool = True):
+        parsed = urllib.parse.urlparse(target_url)
+        hostname = parsed.hostname or ""
+        self.raw_host = hostname.lower()
+        self.include_subs = include_subs
+
+        if self.raw_host.startswith("www."):
+            self.base_domain = self.raw_host[4:]
+        else:
+            self.base_domain = self.raw_host
 
     def is_in_scope(self, url: str) -> bool:
         try:
-            parsed = urlparse(url)
+            parsed = urllib.parse.urlparse(url)
+            if not parsed.netloc and not parsed.hostname:
+                return True
+
             hostname = parsed.hostname
             if not hostname:
                 return False
             hostname = hostname.lower()
-            for scope in self.scopes:
-                if hostname == scope or hostname.endswith("." + scope):
-                    return True
-            return False
+
+            if self.include_subs:
+                # Strict boundary: exact host or a subdomain of the base domain.
+                return hostname == self.base_domain or hostname.endswith("." + self.base_domain)
+            else:
+                # Root domain and its www variant only.
+                return hostname == self.base_domain or hostname == f"www.{self.base_domain}"
         except Exception:
             return False
 
 
-class TargetNormalizer:
-    def __init__(self, scope_manager: ScopeManager):
-        self.scope_manager = scope_manager
+class URLNormalizer:
+    @staticmethod
+    def is_static_asset(url: str) -> bool:
+        try:
+            path = urllib.parse.urlparse(url).path.lower()
+            return any(path.endswith(ext) for ext in STATIC_EXTENSIONS)
+        except Exception:
+            return False
 
-    def normalize(self, base_url: str, raw_url: str) -> str | None:
-        if not raw_url:
-            return None
-        raw_url = raw_url.strip()
-        for char in ['"', "'", '`', '>', '<', ' ']:
-            raw_url = raw_url.rstrip(char)
+    @staticmethod
+    def is_js_file(url: str) -> bool:
+        try:
+            path = urllib.parse.urlparse(url).path.lower()
+            return path.endswith(JS_EXTENSIONS)
+        except Exception:
+            return False
 
-        if any(raw_url.lower().startswith(f"{scheme}:") for scheme in UNSUPPORTED_SCHEMES):
-            return None
+    @staticmethod
+    def normalize(url: str, base_url: str = "") -> str:
+        if base_url:
+            try:
+                url = urllib.parse.urljoin(base_url, url)
+            except Exception:
+                return ""
 
         try:
-            full_url = urljoin(base_url, raw_url)
-            parsed = urlparse(full_url)
-            if parsed.scheme.lower() not in ("http", "https"):
-                return None
+            parsed = urllib.parse.urlparse(url)
+            scheme = parsed.scheme.lower() if parsed.scheme else "http"
+            hostname = (parsed.hostname or "").lower()
 
-            normalized = urlunparse((
-                parsed.scheme.lower(),
-                parsed.netloc.lower(),
-                parsed.path,
-                parsed.params,
-                parsed.query,
-                ""
-            ))
-            return normalized
-        except Exception:
-            return None
+            try:
+                port = parsed.port
+            except ValueError:
+                port = None
 
-
-def is_static_asset(url: str) -> bool:
-    parsed = urlparse(url)
-    path_lower = parsed.path.lower()
-    return any(path_lower.endswith(ext) for ext in STATIC_ASSETS_EXTENSIONS)
-
-
-class JavaScriptAnalyzer:
-    @staticmethod
-    def extract_endpoints(js_content: str, source_url: str, normalizer: TargetNormalizer, scope_manager: ScopeManager) -> set[str]:
-        found = set()
-        for pattern in JS_PATTERNS:
-            for match in pattern.finditer(js_content):
-                endpoint = match.group("url")
-                if endpoint:
-                    normalized = normalizer.normalize(source_url, endpoint)
-                    if normalized and scope_manager.is_in_scope(normalized):
-                        found.add(normalized)
-        return found
-
-
-class HTMLAnalyzer:
-    @staticmethod
-    def analyze(html_text: str) -> tuple[list[str], list[str], list[str]]:
-        soup = BeautifulSoup(html_text, "html.parser")
-        scripts = []
-        inline_scripts = []
-        endpoints = []
-
-        for script in soup.find_all("script"):
-            src = script.get("src")
-            if src:
-                scripts.append(src)
+            if ":" in hostname and not hostname.startswith("["):
+                formatted_host = f"[{hostname}]"
             else:
-                text = script.get_text()
-                if text:
-                    inline_scripts.append(text)
+                formatted_host = hostname
 
-        for tag, attr in [("a", "href"), ("form", "action"), ("iframe", "src"), ("frame", "src")]:
-            for element in soup.find_all(tag):
-                val = element.get(attr)
-                if val:
-                    endpoints.append(val)
+            if port:
+                if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+                    netloc = formatted_host
+                else:
+                    netloc = f"{formatted_host}:{port}"
+            else:
+                netloc = formatted_host
 
-        for link in soup.find_all("link", href=True):
-            rel = link.get("rel", [])
-            if isinstance(rel, str):
-                rel = [rel]
-            rel_str = " ".join(rel).lower()
-            if any(r in rel_str for r in ["canonical", "alternate", "author", "help", "search", "next", "prev"]):
-                endpoints.append(link["href"])
+            path = parsed.path if parsed.path else "/"
 
-        return scripts, inline_scripts, endpoints
+            # Query string: sort parameters with case-insensitive keys so
+            # permutations / casing differences deduplicate after normalization.
+            query_tuples = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            # Parameter names are case-insensitive; values keep their case.
+            query_tuples = [(k.lower(), v) for k, v in query_tuples]
+            query_tuples.sort(key=lambda kv: (kv[0], kv[1]))
+            sorted_query = urllib.parse.urlencode(query_tuples)
+
+            return urllib.parse.urlunparse((scheme, netloc, path, parsed.params, sorted_query, ""))
+        except Exception:
+            return url
 
 
-class ReconEngine:
-    def __init__(
-        self,
-        urls: list[str],
-        scopes: list[str],
-        cookie: str = None,
-        headers: dict = None,
-        timeout: int = 10,
-        insecure: bool = False,
-        threads: int = 10,
-        depth: int = 1,
-        js_only: bool = False,
-        deep: bool = False,
-        quiet: bool = False
-    ):
-        self.initial_urls = [u.strip() for u in urls if u.strip()]
-        self.cookie = cookie
-        self.custom_headers = headers or {}
-        self.timeout = timeout
-        self.insecure = insecure
+class ProgressLine:
+    """One live terminal line for the entire scan (thread-safe)."""
+
+    def __init__(self, quiet: bool = False, prefix: str = "JS-SCAN", width: int = 18):
+        self.quiet = quiet
+        self.prefix = prefix
+        self.width = width
+        self.lock = threading.Lock()
+        self.finished = False
+
+    def update(self, completed: int, total: int, js_count: int, endpoint_count: int):
+        if self.quiet or self.finished or total <= 0:
+            return
+        with self.lock:
+            ratio = min(completed / total, 1.0)
+            filled = int(self.width * ratio)
+            bar = "●" * filled + "○" * (self.width - filled)
+            sys.stdout.write(
+                f"\r[{self.prefix}] [{bar}] {int(ratio * 100):3d}% | "
+                f"{completed}/{total} | JS: {js_count} | EP: {endpoint_count}"
+            )
+            sys.stdout.flush()
+
+    def finish(self):
+        if self.quiet or self.finished:
+            return
+        with self.lock:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self.finished = True
+
+
+class JSExtractorEngine:
+    def __init__(self, target: str, threads: int = 10, depth: int = 2, include_subs: bool = True,
+                 headers: dict = None, cookie: str = None, verify_ssl: bool = True, quiet: bool = False):
+        self.target = URLNormalizer.normalize(target)
+        self.scope = ScopeManager(self.target, include_subs=include_subs)
         self.threads = threads
-        self.depth = depth if (deep or depth > 1) else (2 if deep else 1)
-        self.js_only = js_only
+        self.max_depth = depth
+        self.verify_ssl = verify_ssl
         self.quiet = quiet
 
-        self.scope_manager = ScopeManager(scopes, self.initial_urls)
-        self.normalizer = TargetNormalizer(self.scope_manager)
+        self.session = requests.Session()
 
-        if self.quiet:
-            logger.setLevel(logging.WARNING)
+        no_retry_adapter = HTTPAdapter(
+            max_retries=urllib3.util.retry.Retry(
+                total=0, connect=0, read=0, status=0, redirect=0
+            )
+        )
+        self.session.mount("http://", no_retry_adapter)
+        self.session.mount("https://", no_retry_adapter)
 
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) JSExtractor/1.0",
+            "Accept": "*/*"
+        })
+        if headers:
+            self.session.headers.update(headers)
+        if cookie:
+            self.session.headers.update({"Cookie": cookie})
+
+        self.visited_urls: Set[str] = set()
+        self.discovered_endpoints: Set[str] = set()
+        self.discovered_js_files: Set[str] = set()
         self.lock = threading.Lock()
-        self.visited_urls = set()
-        self.discovered_endpoints = set()
-        self.discovered_js = set()
+        self.progress = ProgressLine(quiet=quiet)
 
-    def fetch_url(self, url: str) -> tuple[str | None, str | None, str]:
-        session = get_session(self.cookie, self.custom_headers, self.insecure)
-        try:
-            with session.get(url, timeout=self.timeout, allow_redirects=True, stream=True) as response:
-                final_url = response.url
-                content_type = response.headers.get("Content-Type", "")
-                
-                if response.status_code >= 400:
-                    return None, None, final_url
+    def fetch_url(self, url: str) -> Tuple[str, str]:
+        current_url = url
 
+        for _ in range(MAX_REDIRECTS):
+            # Validate every hop against scope; out-of-scope redirects are dropped.
+            if not self.scope.is_in_scope(current_url):
+                return "", ""
+
+            try:
+                response = self.session.get(
+                    current_url,
+                    timeout=10,
+                    verify=self.verify_ssl,
+                    stream=True,
+                    allow_redirects=False
+                )
+            except Exception:
+                return "", ""
+
+            if response.is_redirect or response.is_permanent_redirect or (300 <= response.status_code < 400):
+                location = response.headers.get("Location")
+                response.close()
+                if not location:
+                    return "", ""
+                current_url = URLNormalizer.normalize(location, base_url=current_url)
+                continue
+
+            try:
                 content_length = response.headers.get("Content-Length")
-                if content_length and int(content_length) > MAX_RESPONSE_SIZE:
-                    return None, None, final_url
+                if content_length:
+                    try:
+                        if int(content_length) > MAX_RESPONSE_SIZE:
+                            response.close()
+                            return "", ""
+                    except (ValueError, TypeError):
+                        pass
 
-                chunks = []
-                downloaded = 0
-                for chunk in response.iter_content(chunk_size=8192):
-                    downloaded += len(chunk)
-                    if downloaded > MAX_RESPONSE_SIZE:
-                        break
-                    chunks.append(chunk)
-                raw_content = b"".join(chunks)
+                raw_chunks = []
+                byte_size = 0
+
+                for chunk in response.iter_content(chunk_size=8192, decode_unicode=False):
+                    if chunk:
+                        byte_size += len(chunk)
+                        if byte_size > MAX_RESPONSE_SIZE:
+                            response.close()
+                            return "", ""
+                        raw_chunks.append(chunk)
+
+                raw_data = b"".join(raw_chunks)
+                content_type = response.headers.get("Content-Type", "")
 
                 encoding = response.encoding or "utf-8"
                 try:
-                    text = raw_content.decode(encoding, errors="ignore")
+                    text_content = raw_data.decode(encoding, errors="replace")
                 except Exception:
-                    text = raw_content.decode("utf-8", errors="ignore")
+                    text_content = raw_data.decode("utf-8", errors="replace")
 
-                return text, content_type, final_url
-        except requests.exceptions.RequestException:
-            return None, None, url
+                return text_content, content_type
+            finally:
+                response.close()
 
-    def process_target(self, url: str) -> tuple[set[str], set[str], set[str]]:
-        local_endpoints = set()
-        local_js = set()
-        next_crawl_targets = set()
+        return "", ""
 
-        with self.lock:
-            if url in self.visited_urls:
-                return local_endpoints, local_js, next_crawl_targets
-            self.visited_urls.add(url)
+    def process_html_content(self, url: str, html_text: str, current_depth: int) -> List[Tuple[str, int]]:
+        """HTML is crawled ONLY to locate JavaScript resources and deeper pages.
 
-        text, content_type, final_url = self.fetch_url(url)
-        if not text:
-            return local_endpoints, local_js, next_crawl_targets
+        No HTML/PHP/CSS/XML/JSON/PDF/media/etc. link is ever registered as
+        a resource, and no endpoint is extracted from HTML.
+        """
+        next_targets = []
 
-        with self.lock:
-            if self.scope_manager.is_in_scope(final_url):
-                local_endpoints.add(final_url)
+        # 1. Extract JavaScript resources (.js / .mjs / .cjs) only.
+        js_matches = JS_FILE_REGEX.findall(html_text)
+        for match in js_matches:
+            js_link = match[0] or match[1]
+            if js_link:
+                norm_js = URLNormalizer.normalize(js_link, base_url=url)
+                if self.scope.is_in_scope(norm_js) and URLNormalizer.is_js_file(norm_js):
+                    with self.lock:
+                        self.discovered_js_files.add(norm_js)
 
-        if self.js_only or "javascript" in content_type.lower() or final_url.endswith(".js") or url.endswith(".js"):
-            with self.lock:
-                local_js.add(final_url)
-            extracted = JavaScriptAnalyzer.extract_endpoints(text, final_url, self.normalizer, self.scope_manager)
-            local_endpoints.update(extracted)
-            return local_endpoints, local_js, next_crawl_targets
-
-        scripts, inline_scripts, raw_endpoints = HTMLAnalyzer.analyze(text)
-
-        for src in scripts:
-            js_url = self.normalizer.normalize(final_url, src)
-            if js_url and self.scope_manager.is_in_scope(js_url):
+        # 2. Follow HTML links purely for depth crawling — never as resources.
+        raw_hrefs = re.findall(r'href=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+        for href in raw_hrefs:
+            norm_url = URLNormalizer.normalize(href, base_url=url)
+            if self.scope.is_in_scope(norm_url) and not URLNormalizer.is_static_asset(norm_url):
                 with self.lock:
-                    local_js.add(js_url)
-                next_crawl_targets.add(js_url)
+                    if norm_url not in self.visited_urls:
+                        if current_depth < self.max_depth:
+                            next_targets.append((norm_url, current_depth + 1))
 
-        for raw_ep in raw_endpoints:
-            norm = self.normalizer.normalize(final_url, raw_ep)
-            if norm and self.scope_manager.is_in_scope(norm):
-                local_endpoints.add(norm)
-                if not is_static_asset(norm):
-                    next_crawl_targets.add(norm)
+        return next_targets
 
-        for inline_js in inline_scripts:
-            extracted = JavaScriptAnalyzer.extract_endpoints(inline_js, final_url, self.normalizer, self.scope_manager)
-            local_endpoints.update(extracted)
+    def process_js_content(self, js_url: str, js_text: str):
+        """Extract nested JS references and endpoints from JavaScript source."""
+        # 1. Nested JavaScript files.
+        js_matches = JS_FILE_REGEX.findall(js_text)
+        for match in js_matches:
+            js_link = match[0] or match[1]
+            if js_link:
+                norm_js = URLNormalizer.normalize(js_link, base_url=js_url)
+                if self.scope.is_in_scope(norm_js) and URLNormalizer.is_js_file(norm_js):
+                    with self.lock:
+                        self.discovered_js_files.add(norm_js)
 
-        return local_endpoints, local_js, next_crawl_targets
+        # 2. Endpoints (absolute / protocol-relative / relative) from JS only.
+        endpoints = ENDPOINT_REGEX.findall(js_text)
+        for ep in endpoints:
+            norm_ep = URLNormalizer.normalize(ep, base_url=js_url)
+            if self.scope.is_in_scope(norm_ep) and not URLNormalizer.is_static_asset(norm_ep):
+                with self.lock:
+                    self.discovered_endpoints.add(norm_ep)
 
-    def run(self) -> tuple[list[str], list[str]]:
-        current_level_urls = set(self.initial_urls)
+    def run(self):
+        # ---- Phase 1: crawl pages within depth/scope to find JS resources ----
+        queue: List[Tuple[str, int]] = [(self.target, 0)]
+        self.visited_urls.add(self.target)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-            for current_depth in range(self.depth):
-                if not current_level_urls:
-                    break
+        progress_total = 0
+        progress_done = 0
 
-                futures = {
-                    executor.submit(self.process_target, url): url 
-                    for url in current_level_urls 
+        while queue:
+            progress_total += len(queue)
+            next_queue = []
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
+                future_to_url = {
+                    executor.submit(self.fetch_url, u): (u, d) for u, d in queue
                 }
-                
-                next_level_urls = set()
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        eps, jss, next_targets = future.result()
-                        with self.lock:
-                            self.discovered_endpoints.update(eps)
-                            self.discovered_js.update(jss)
-                            if current_depth + 1 < self.depth:
-                                for nt in next_targets:
-                                    if nt not in self.visited_urls:
-                                        next_level_urls.add(nt)
-                    except Exception:
-                        pass
-                current_level_urls = next_level_urls
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-            unvisited_js = [js for js in self.discovered_js if js not in self.visited_urls]
-            if unvisited_js:
-                futures = {executor.submit(self.process_target, js): js for js in unvisited_js}
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        eps, jss, _ = future.result()
-                        with self.lock:
-                            self.discovered_endpoints.update(eps)
-                            self.discovered_js.update(jss)
-                    except Exception:
-                        pass
+                for future in concurrent.futures.as_completed(future_to_url):
+                    u, d = future_to_url[future]
+                    html_content, _ = future.result()
 
-        sorted_endpoints = sorted(list(self.discovered_endpoints))
-        sorted_js = sorted(list(self.discovered_js))
-        return sorted_endpoints, sorted_js
+                    if html_content:
+                        new_links = self.process_html_content(u, html_content, d)
+                        for link, depth in new_links:
+                            if link not in self.visited_urls:
+                                self.visited_urls.add(link)
+                                next_queue.append((link, depth))
 
+                    progress_done += 1
+                    self.progress.update(
+                        progress_done, progress_total,
+                        len(self.discovered_js_files), len(self.discovered_endpoints)
+                    )
 
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Production-quality URL and JavaScript endpoint reconnaissance utility.",
-        epilog="Example: python3 recon_utility.py -u https://example.com --scope example.com --deep"
-    )
-    parser.add_argument("-u", "--url", action="append", help="Target URL (can be specified multiple times)")
-    parser.add_argument("-f", "--file", help="File containing target URLs or JS endpoints (one per line)")
-    parser.add_argument("--js", action="store_true", help="Treat input targets strictly as JavaScript files")
-    parser.add_argument("--deep", action="store_true", help="Enable deep crawling (shortcut for depth=2)")
-    parser.add_argument("--depth", type=int, default=1, help="Crawling depth (default: 1)")
-    parser.add_argument("--scope", action="append", help="Allowed domain scope (e.g. target.com, can be multiple)")
-    parser.add_argument("-c", "--cookie", help="Cookie header value for authenticated requests")
-    parser.add_argument("-o", "--output", help="Output file path for discovered endpoints")
-    parser.add_argument("--output-js", help="Output file path for discovered JavaScript resources")
-    parser.add_argument("-t", "--threads", type=int, default=10, help="Number of concurrent threads (default: 10)")
-    parser.add_argument("--timeout", type=int, default=10, help="HTTP request timeout in seconds (default: 10)")
-    parser.add_argument("--insecure", action="store_true", help="Disable SSL/TLS certificate verification")
-    parser.add_argument("-q", "--quiet", action="store_true", help="Suppress non-essential log output")
-    return parser.parse_args()
+            queue = next_queue
 
+        # ---- Phase 2: fetch JS sources for nested JS + endpoint extraction ----
+        js_list = list(self.discovered_js_files)
+        progress_total += len(js_list)
 
-def load_urls_from_file(file_path: str) -> list[str]:
-    urls = []
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    urls.append(line)
-    except Exception as e:
-        logger.error(f"Failed to read file {file_path}: {e}")
-    return urls
+        if js_list:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
+                future_to_js = {executor.submit(self.fetch_url, js_url): js_url for js_url in js_list}
+
+                for future in concurrent.futures.as_completed(future_to_js):
+                    js_url = future_to_js[future]
+                    js_content, _ = future.result()
+
+                    if js_content:
+                        self.process_js_content(js_url, js_content)
+
+                    progress_done += 1
+                    self.progress.update(
+                        progress_done, progress_total,
+                        len(self.discovered_js_files), len(self.discovered_endpoints)
+                    )
+
+        self.progress.finish()
 
 
 def main():
-    args = parse_arguments()
+    parser = argparse.ArgumentParser(description="Strict JavaScript-Only Scanner (.js / .mjs / .cjs)")
+    parser.add_argument("-u", "--url", help="Target URL (e.g., https://example.com)")
+    parser.add_argument("-l", "--list", help="Target URLs file")
+    parser.add_argument("-o", "--output", help="Output file for discovered JavaScript resources")
+    parser.add_argument("--js", action="store_true",
+                        help="Accepted for compatibility; the scanner is always JS-only")
+    parser.add_argument("-t", "--threads", type=int, default=10, help="Number of threads (Default: 10)")
+    parser.add_argument("-d", "--depth", type=int, default=1, help="Crawl depth limit (Default: 1)")
+    parser.add_argument("--deep", action="store_true", help="Set depth limit to 5")
+    parser.add_argument("--no-sub", action="store_true", help="Exclude subdomains from scope")
+    parser.add_argument("-H", "--header", action="append", help="Custom Header (e.g. -H 'Authorization: Bearer token')")
+    parser.add_argument("-c", "--cookie", help="Custom cookie string")
+    parser.add_argument("-k", "--insecure", action="store_true", help="Disable SSL certificate verification")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Suppress output except errors")
+
+    args = parser.parse_args()
+
+    if not args.url and not args.list:
+        parser.error("At least one target (-u or -l) must be specified.")
+
+    if args.threads < 1:
+        parser.error("--threads must be at least 1")
+
+    if args.depth < 0:
+        parser.error("--depth cannot be negative")
+
+    if args.quiet:
+        logger.setLevel(logging.ERROR)
+
+    custom_headers = {}
+    if args.header:
+        for header_str in args.header:
+            if ":" not in header_str:
+                continue
+            k, v = header_str.split(":", 1)
+            k_clean, v_clean = k.strip(), v.strip()
+            if k_clean:
+                custom_headers[k_clean] = v_clean
 
     targets = []
     if args.url:
-        targets.extend(args.url)
-    if args.file:
-        targets.extend(load_urls_from_file(args.file))
+        targets.append(args.url)
+    if args.list:
+        if not os.path.isfile(args.list):
+            parser.error(f"Target list not found: {args.list}")
+        with open(args.list, "r", encoding="utf-8") as f:
+            targets.extend([line.strip() for line in f if line.strip()])
 
-    if not targets:
-        logger.error("No valid targets provided via -u/--url or -f/--file.")
-        sys.exit(1)
+    depth = 5 if args.deep else args.depth
 
-    valid_targets = []
-    for t in targets:
-        if not t.startswith("http://") and not t.startswith("https://"):
-            t = "http://" + t
-        parsed = urlparse(t)
-        if parsed.netloc:
-            valid_targets.append(t)
-        else:
-            logger.warning(f"Skipping malformed URL: {t}")
-
-    if not valid_targets:
-        logger.error("No valid URLs found after validation.")
-        sys.exit(1)
-
-    scopes = args.scope if args.scope else []
+    all_js_files = set()
 
     if not args.quiet:
-        print(f"\n[+] Target Count: {len(valid_targets)}")
-        print(f"[+] Scopes Defined: {scopes if scopes else 'Auto-derived from targets'}")
-        print(f"[+] Threads: {args.threads} | Depth: {args.depth} | JS-Only Mode: {args.js}\n")
+        print(f"[+] Target Count: {len(targets)}")
+        print(f"[+] Mode: JavaScript-Only (.js/.mjs/.cjs) | Subdomains: {'excluded' if args.no_sub else 'included'}")
+        print(f"[+] Threads: {args.threads} | Depth: {depth}")
 
-    engine = ReconEngine(
-        urls=valid_targets,
-        scopes=scopes,
-        cookie=args.cookie,
-        timeout=args.timeout,
-        insecure=args.insecure,
-        threads=args.threads,
-        depth=args.depth,
-        js_only=args.js,
-        deep=args.deep,
-        quiet=args.quiet
-    )
+    for target in targets:
+        engine = JSExtractorEngine(
+            target=target,
+            threads=args.threads,
+            depth=depth,
+            include_subs=not args.no_sub,
+            headers=custom_headers,
+            cookie=args.cookie,
+            verify_ssl=not args.insecure,
+            quiet=args.quiet
+        )
+        engine.run()
+        all_js_files.update(engine.discovered_js_files)
 
-    endpoints, js_files = engine.run()
+    # Final resource output: JavaScript files ONLY, deduplicated post-normalization.
+    results = sorted(all_js_files)
 
     if not args.quiet:
-        print(f"\n[+] Discovered Endpoints ({len(endpoints)}):")
-        for ep in endpoints:
-            print(ep)
-
-        print(f"\n[+] Discovered JavaScript Resources ({len(js_files)}):")
-        for js in js_files:
-            print(js)
+        print(f"\n[+] JavaScript Files ({len(results)}):")
+        for item in results:
+            print(item)
 
     if args.output:
-        try:
-            with open(args.output, "w", encoding="utf-8") as f:
-                f.write("\n".join(endpoints) + "\n")
-            logger.info(f"Endpoints successfully written to {args.output}")
-        except Exception as e:
-            logger.error(f"Failed to write endpoints to output file: {e}")
-            sys.exit(1)
-
-    if args.output_js:
-        try:
-            with open(args.output_js, "w", encoding="utf-8") as f:
-                f.write("\n".join(js_files) + "\n")
-            logger.info(f"JavaScript URLs successfully written to {args.output_js}")
-        except Exception as e:
-            logger.error(f"Failed to write JavaScript URLs to output file: {e}")
-            sys.exit(1)
-
-    sys.exit(0)
+        with open(args.output, "w") as f:
+            for item in results:
+                f.write(f"{item}\n")
+        if not args.quiet:
+            logger.info(f"Saved {len(results)} JavaScript resources to {args.output}")
 
 
 if __name__ == "__main__":
