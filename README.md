@@ -27,3 +27,25 @@
   }
 }
 ```
+
+
+## Contributors
+
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/inteleon404">
+        <img src="https://github.com/inteleon404.png" width="80" height="80" alt="inteleon404"/>
+      </a>
+      <br>
+      <a href="https://github.com/inteleon404"><b>inteleon404</b></a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/loxray303">
+        <img src="https://github.com/loxray303.png" width="80" height="80" alt="loxray303"/>
+      </a>
+      <br>
+      <a href="https://github.com/loxray303"><b>loxray303</b></a>
+    </td>
+  </tr>
+</table>
