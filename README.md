@@ -54,5 +54,12 @@
         <strong>loxray303</strong>
       </a>
     </td>
+    <td align="center">
+      <a href="https://github.com/rushbruh">
+        <img src="https://github.com/rushbruh.png" width="80" height="80" alt="rushbruh"/>
+        <br />
+        <strong>rushbruh</strong>
+      </a>
+    </td>
   </tr>
 </table>
