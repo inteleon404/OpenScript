@@ -12,14 +12,11 @@ from typing import Dict, List, Set, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 
-# SSL ওয়ার্নিং পপ-আপ নিষ্ক্রিয় করা
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# লগিং কনফিগারেশন
 logging.basicConfig(format="[%(levelname)s] %(message)s", level=logging.INFO)
 logger = logging.getLogger("recon")
 
-# রেগুলার এক্সপ্রেশন ফর এন্ডপয়েন্ট ও জেস ফাইল এক্সট্রাকশন
 ENDPOINT_REGEX = re.compile(
     r'(?:"|\')('
     r'(?:[a-zA-Z]{1,10}://|//)'
@@ -50,11 +47,6 @@ MAX_REDIRECTS = 5
 
 
 class ScopeManager:
-    """ডোমেইন স্কোপ ফিল্টারিং সিস্টেম।
-    Default: Subdomains included (e.g. api.example.com, dev.example.com)
-    --no-sub: Root domain + www alias only.
-    Strict label boundary checking prevents suffix/prefix spoofing (evil-example.com or example.com.evil.com).
-    """
     def __init__(self, target_url: str, include_subs: bool = True):
         parsed = urllib.parse.urlparse(target_url)
         hostname = parsed.hostname or ""
@@ -86,8 +78,8 @@ class ScopeManager:
 
 
 class URLNormalizer:
-    """ইউআরএল নরমালাইজেশন, IPv6 ব্র্যাকেট ফরম্যাটিং ও স্ট্যাটিক অ্যাসেট ফিল্টারিং"""
-    @staticmethod
+
+@staticmethod
     def is_static_asset(url: str) -> bool:
         try:
             path = urllib.parse.urlparse(url).path.lower()
@@ -106,7 +98,6 @@ class URLNormalizer:
         hostname = parsed.hostname or ""
         port = parsed.port
         
-        # IPv6 адреসের জন্য সঠিক ব্র্যাকেট ফরম্যাটিং
         if ":" in hostname and not hostname.startswith("["):
             formatted_host = f"[{hostname}]"
         else:
@@ -122,7 +113,6 @@ class URLNormalizer:
 
         path = parsed.path if parsed.path else "/"
         
-        # কুয়েরি প্যারামিটার সর্টিং
         query_tuples = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
         query_tuples.sort()
         sorted_query = urllib.parse.urlencode(query_tuples)
@@ -131,7 +121,6 @@ class URLNormalizer:
 
 
 def render_progress(completed: int, total: int, js_count: int, endpoint_count: int, prefix: str = "SCAN", quiet: bool = False):
-    """ফেজ অনুযায়ী প্রোগ্রেস বার ডিসপ্লে করে ([SCAN] / [JS-SCAN])"""
     if quiet or total <= 0:
         return
     width = 18
@@ -163,7 +152,6 @@ class ReconEngine:
         # HTTP Session Setup
         self.session = requests.Session()
         
-        # Automatic Retry নিষ্ক্রিয় করা
         no_retry_adapter = HTTPAdapter(
             max_retries=urllib3.util.retry.Retry(
                 total=0, connect=0, read=0, status=0, redirect=0
@@ -172,7 +160,6 @@ class ReconEngine:
         self.session.mount("http://", no_retry_adapter)
         self.session.mount("https://", no_retry_adapter)
 
-        # ডিফল্ট হেডার্স সেটআপ
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ReconEngine/1.0",
             "Accept": "*/*"
@@ -182,7 +169,6 @@ class ReconEngine:
         if cookie:
             self.session.headers.update({"Cookie": cookie})
 
-        # থ্রেড-সেফ ডেটা স্ট্রাকচার
         self.visited_urls: Set[str] = set()
         self.discovered_endpoints: Set[str] = set()
         self.discovered_js_files: Set[str] = set()
@@ -262,7 +248,6 @@ class ReconEngine:
         return "", ""
 
     def process_html_content(self, url: str, html_text: str, current_depth: int) -> List[Tuple[str, int]]:
-        """HTML ফাইল বিশ্লেষণ করে লিঙ্ক, JS ফাইল ও এন্ডপয়েন্ট খুঁজে বের করে"""
         next_targets = []
         
         # 1. Extract Links/HTML endpoints
@@ -297,7 +282,6 @@ class ReconEngine:
         return next_targets
 
     def run(self):
-        """মোট ফেজ ম্যানেজমেন্ট: ১. মেইন ক্রলিং [SCAN], ২. জেস অ্যানালাইসিস [JS-SCAN]"""
         # Phase 1: Crawling
         queue: List[Tuple[str, int]] = [(self.target, 0)]
         self.visited_urls.add(self.target)
