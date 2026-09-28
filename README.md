@@ -20,11 +20,6 @@
       "path": "bash",
       "description": "Shell automation & workflow macros"
     }
-  ],
-  "execution_commands": {
-    "python": "python3 main.py | tee python_output.log",
-    "bash": "bash setup.sh | tee bash_output.log"
-  }
 }
 ```
 
