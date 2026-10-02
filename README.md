@@ -60,7 +60,7 @@
       <a href="https://github.com/bytes-Knight">
         <img src="https://github.com/bytes-Knight.png" width="80" height="80" alt="bytes-Knight"/>
         <br />
-        <strong>rushbruh</strong>
+        <strong>bytes-Knight</strong>
       </a>
     </td>
   </tr>
